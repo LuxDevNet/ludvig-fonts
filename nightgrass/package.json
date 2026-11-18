@@ -1,0 +1,9 @@
+{
+  "name": "nightgrass",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run server.ts",
+    "dev": "bun run --hot server.ts"
+  }
+}
