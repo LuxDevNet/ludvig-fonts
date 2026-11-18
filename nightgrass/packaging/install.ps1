@@ -5,9 +5,12 @@ param(
 
 $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+# Windows PowerShell 5.1 reports X64 when it is running emulated on ARM64.
+# The machine environment value is the OS architecture.
+$machine = [Environment]::GetEnvironmentVariable("PROCESSOR_ARCHITECTURE", "Machine")
+$arch = if ($machine -eq "ARM64") { "Arm64" } else { "X64" }
 
-$payloadName = if ($arch -eq [System.Runtime.InteropServices.Architecture]::Arm64) {
+$payloadName = if ($arch -eq "Arm64") {
     "Nightgrass-arm64.exe"
 } else {
     "Nightgrass-x64.exe"
