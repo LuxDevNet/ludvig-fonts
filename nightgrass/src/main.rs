@@ -12,6 +12,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
+use winit::application::ApplicationHandler;
+use winit::dpi::LogicalSize;
+use winit::event::WindowEvent;
+use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::window::{Window, WindowId};
+use wry::WebViewBuilder;
 
 const PAGE: &str = include_str!("../web/index.html");
 const CSS: &str = include_str!("../meadow.css");
@@ -57,7 +63,7 @@ fn main() {
     let open = !std::env::args().any(|arg| arg == "--no-open");
     if let Some(url) = probe_existing() {
         if open {
-            open_browser(&url);
+            open_app(&url);
         }
         return;
     }
@@ -89,15 +95,98 @@ fn main() {
     };
     let url = format!("http://127.0.0.1:{port}");
     log_line(&format!("Nightgrass is at {url}"));
+    let server_state = Arc::clone(&state);
+    let server_thread = thread::spawn(move || {
+        for request in server.incoming_requests() {
+            let state = Arc::clone(&server_state);
+            thread::spawn(move || {
+                let _ = handle(request, &state);
+            });
+        }
+    });
     if open {
-        open_browser(&url);
+        open_app(&url);
+        std::process::exit(0);
+    }
+    let _ = server_thread.join();
+}
+
+struct NightWindow {
+    url: String,
+    window: Option<Window>,
+    webview: Option<wry::WebView>,
+    error: Option<String>,
+}
+
+impl ApplicationHandler for NightWindow {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() || self.error.is_some() {
+            return;
+        }
+        let attrs = Window::default_attributes()
+            .with_title("Nightgrass")
+            .with_inner_size(LogicalSize::new(1200.0, 800.0));
+        let window = match event_loop.create_window(attrs) {
+            Ok(window) => window,
+            Err(err) => {
+                self.error = Some(format!("Nightgrass could not open a window: {err}"));
+                event_loop.exit();
+                return;
+            }
+        };
+        match WebViewBuilder::new()
+            .with_url(&self.url)
+            .with_background_color((4, 22, 20, 255))
+            .build(&window)
+        {
+            Ok(webview) => {
+                self.window = Some(window);
+                self.webview = Some(webview);
+            }
+            Err(err) => {
+                self.error = Some(format!("Nightgrass could not open its window: {err}"));
+                event_loop.exit();
+            }
+        }
     }
 
-    for request in server.incoming_requests() {
-        let state = Arc::clone(&state);
-        thread::spawn(move || {
-            let _ = handle(request, &state);
-        });
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _id: WindowId,
+        event: WindowEvent,
+    ) {
+        if let WindowEvent::CloseRequested = event {
+            event_loop.exit();
+        }
+    }
+}
+
+fn open_app(url: &str) {
+    if let Err(err) = show_window(url) {
+        log_line(&err);
+        complain(&err);
+        open_browser(url);
+    }
+}
+
+fn show_window(url: &str) -> Result<(), String> {
+    if let Ok(base) = std::env::var("LOCALAPPDATA") {
+        let dir = PathBuf::from(base).join("Nightgrass").join("webview");
+        fs::create_dir_all(&dir).ok();
+        std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", dir);
+    }
+    let event_loop = EventLoop::new().map_err(|err| err.to_string())?;
+    let mut host = NightWindow {
+        url: url.to_string(),
+        window: None,
+        webview: None,
+        error: None,
+    };
+    event_loop.run_app(&mut host).map_err(|err| err.to_string())?;
+    match host.error.take() {
+        Some(err) => Err(err),
+        None => Ok(()),
     }
 }
 
