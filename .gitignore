@@ -1,0 +1,12 @@
+# Nightgrass build output and the loose checkout exe
+nightgrass/target/
+Nightgrass.exe
+*.pdb
+
+# Per-user library roots and logs
+nightgrass/data/
+
+# OS clutter
+Thumbs.db
+Desktop.ini
+.DS_Store
