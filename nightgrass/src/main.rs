@@ -15,13 +15,15 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 use wry::WebViewBuilder;
 
 const PAGE: &str = include_str!("../web/index.html");
 const CSS: &str = include_str!("../meadow.css");
 const JS: &str = include_str!("../web/app.js");
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const REPO: &str = "LuxDevNet/ludvig-fonts";
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct Root {
@@ -40,6 +42,14 @@ struct Face {
     ext: String,
     bytes: u64,
     rel: String,
+    tags: Vec<String>,
+}
+
+struct UpdateInfo {
+    current: String,
+    latest: String,
+    state: String,
+    detail: String,
 }
 
 #[derive(Clone)]
@@ -57,6 +67,7 @@ struct App {
     ready: bool,
     library: String,
     fingerprint: u64,
+    update: UpdateInfo,
 }
 
 fn main() {
@@ -77,6 +88,12 @@ fn main() {
         ready: false,
         library: find_library().unwrap_or_default(),
         fingerprint: 0,
+        update: UpdateInfo {
+            current: VERSION.to_string(),
+            latest: String::new(),
+            state: "checking".to_string(),
+            detail: String::new(),
+        },
     };
     load_roots(&mut app);
     let state = Arc::new(Mutex::new(app));
@@ -95,6 +112,8 @@ fn main() {
     };
     let url = format!("http://127.0.0.1:{port}");
     log_line(&format!("Nightgrass is at {url}"));
+    let updater = Arc::clone(&state);
+    thread::spawn(move || watch_github(updater));
     let server_state = Arc::clone(&state);
     let server_thread = thread::spawn(move || {
         for request in server.incoming_requests() {
@@ -111,20 +130,31 @@ fn main() {
     let _ = server_thread.join();
 }
 
+#[derive(Clone, Copy)]
+enum FrameCmd {
+    Close,
+    Minimize,
+    ToggleMax,
+    Drag,
+}
+
 struct NightWindow {
     url: String,
+    proxy: EventLoopProxy<FrameCmd>,
     window: Option<Window>,
     webview: Option<wry::WebView>,
     error: Option<String>,
 }
 
-impl ApplicationHandler for NightWindow {
+impl ApplicationHandler<FrameCmd> for NightWindow {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() || self.error.is_some() {
             return;
         }
         let attrs = Window::default_attributes()
             .with_title("Nightgrass")
+            .with_decorations(false)
+            .with_resizable(true)
             .with_inner_size(LogicalSize::new(1200.0, 800.0));
         let window = match event_loop.create_window(attrs) {
             Ok(window) => window,
@@ -134,9 +164,20 @@ impl ApplicationHandler for NightWindow {
                 return;
             }
         };
+        let proxy = self.proxy.clone();
         match WebViewBuilder::new()
             .with_url(&self.url)
             .with_background_color((4, 22, 20, 255))
+            .with_ipc_handler(move |request: wry::http::Request<String>| {
+                let cmd = match request.body().as_str() {
+                    "close" => FrameCmd::Close,
+                    "minimize" => FrameCmd::Minimize,
+                    "maximize" => FrameCmd::ToggleMax,
+                    "drag" => FrameCmd::Drag,
+                    _ => return,
+                };
+                let _ = proxy.send_event(cmd);
+            })
             .build(&window)
         {
             Ok(webview) => {
@@ -146,6 +187,20 @@ impl ApplicationHandler for NightWindow {
             Err(err) => {
                 self.error = Some(format!("Nightgrass could not open its window: {err}"));
                 event_loop.exit();
+            }
+        }
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: FrameCmd) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        match event {
+            FrameCmd::Close => event_loop.exit(),
+            FrameCmd::Minimize => window.set_minimized(true),
+            FrameCmd::ToggleMax => window.set_maximized(!window.is_maximized()),
+            FrameCmd::Drag => {
+                let _ = window.drag_window();
             }
         }
     }
@@ -176,9 +231,13 @@ fn show_window(url: &str) -> Result<(), String> {
         fs::create_dir_all(&dir).ok();
         std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", dir);
     }
-    let event_loop = EventLoop::new().map_err(|err| err.to_string())?;
+    let event_loop = EventLoop::<FrameCmd>::with_user_event()
+        .build()
+        .map_err(|err| err.to_string())?;
+    let proxy = event_loop.create_proxy();
     let mut host = NightWindow {
         url: url.to_string(),
+        proxy,
         window: None,
         webview: None,
         error: None,
@@ -243,6 +302,7 @@ fn handle(mut request: Request, state: &Mutex<App>) -> std::io::Result<()> {
         (Method::Get | Method::Head, "/app.js") => html(JS, "text/javascript; charset=utf-8"),
         (Method::Get | Method::Head, "/api/catalog") => json_body(200, &catalog_json(state)),
         (Method::Get | Method::Head, "/api/revision") => json_body(200, &revision_json(state)),
+        (Method::Get | Method::Head, "/api/update") => json_body(200, &update_json(state)),
         (Method::Get | Method::Head, path) if path.starts_with("/api/font/") => {
             let id = &path["/api/font/".len()..];
             font_response(state, id, range.as_deref())
@@ -639,14 +699,17 @@ fn scan_root(root: &Root) -> Result<(Vec<Face>, HashMap<String, PathBuf>), Strin
             } else {
                 root.label.clone()
             };
+            let name = pretty_stem(stem);
+            let tags = face_tags(&name, &pack, &ext);
             let face = Face {
                 id: hash_id(&path.to_string_lossy().to_lowercase()),
                 root_id: root.id.clone(),
                 pack,
-                name: pretty_stem(stem),
+                name,
                 ext,
                 bytes,
                 rel: child_rel,
+                tags,
             };
             found.insert(key, (face, path, rank));
         }
@@ -658,6 +721,230 @@ fn scan_root(root: &Root) -> Result<(Vec<Face>, HashMap<String, PathBuf>), Strin
         faces.push(face);
     }
     Ok((faces, files))
+}
+
+fn face_tags(name: &str, pack: &str, ext: &str) -> Vec<String> {
+    let flat = norm(&format!("{name} {pack}"));
+    let weight = [
+        ("extralight", "extralight"),
+        ("ultralight", "ultralight"),
+        ("hairline", "hairline"),
+        ("semibold", "semibold"),
+        ("demibold", "semibold"),
+        ("extrabold", "extrabold"),
+        ("ultrabold", "extrabold"),
+        ("black", "black"),
+        ("heavy", "heavy"),
+        ("medium", "medium"),
+        ("light", "light"),
+        ("thin", "thin"),
+        ("bold", "bold"),
+        ("regular", "regular"),
+        ("book", "book"),
+    ]
+    .into_iter()
+    .find(|(needle, _)| flat.contains(needle))
+    .map(|(_, label)| label)
+    .unwrap_or("regular");
+    let posture = if flat.contains("italic") {
+        "italic"
+    } else if flat.contains("oblique") {
+        "oblique"
+    } else {
+        "roman"
+    };
+    let width = if ["ultracondensed", "extracondensed", "compressed", "condensed", "compact", "narrow"]
+        .iter()
+        .any(|needle| flat.contains(needle))
+    {
+        "condensed"
+    } else if ["ultraexpanded", "extraexpanded", "expanded", "extended", "wide"]
+        .iter()
+        .any(|needle| flat.contains(needle))
+    {
+        "extended"
+    } else {
+        "normal"
+    };
+    let class = if flat.contains("mono") || flat.contains("code") {
+        "mono"
+    } else if flat.contains("script") || flat.contains("hand") || flat.contains("cursive") {
+        "script"
+    } else if flat.contains("symbol") || flat.contains("dingbat") {
+        "symbol"
+    } else if flat.contains("sans") || flat.contains("grotesk") {
+        "sans"
+    } else if flat.contains("serif") {
+        "serif"
+    } else if flat.contains("display") || flat.contains("headline") || flat.contains("poster") || flat.contains("gothic") {
+        "display"
+    } else {
+        "text"
+    };
+    vec![
+        weight.to_string(),
+        posture.to_string(),
+        width.to_string(),
+        class.to_string(),
+        ext.to_string(),
+    ]
+}
+
+fn update_json(state: &Mutex<App>) -> String {
+    let app = state.lock().expect("state");
+    serde_json::json!({
+        "current": app.update.current,
+        "latest": app.update.latest,
+        "state": app.update.state,
+        "detail": app.update.detail,
+    })
+    .to_string()
+}
+
+fn set_update(state: &Mutex<App>, latest: &str, phase: &str, detail: &str) {
+    let mut app = state.lock().expect("state");
+    app.update.latest = latest.to_string();
+    app.update.state = phase.to_string();
+    app.update.detail = detail.to_string();
+}
+
+fn watch_github(state: Arc<Mutex<App>>) {
+    thread::sleep(Duration::from_secs(1));
+    let payload = match quiet("gh", &["api", &format!("repos/{REPO}/releases/latest")]) {
+        Ok(text) => text,
+        Err(err) => {
+            let detail = if err.is_empty() {
+                "GitHub Latest is not visible from this PC.".to_string()
+            } else {
+                err
+            };
+            set_update(&state, "", "error", &detail);
+            return;
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(&payload) {
+        Ok(value) => value,
+        Err(err) => {
+            set_update(&state, "", "error", &err.to_string());
+            return;
+        }
+    };
+    let tag = value
+        .get("tag_name")
+        .and_then(|item| item.as_str())
+        .unwrap_or("")
+        .trim()
+        .trim_start_matches('v')
+        .to_string();
+    if tag.is_empty() {
+        set_update(&state, "", "error", "GitHub Latest has no version tag.");
+        return;
+    }
+    let Some(latest) = parse_version(&tag) else {
+        set_update(&state, &tag, "error", "GitHub Latest version could not be read.");
+        return;
+    };
+    let Some(current) = parse_version(VERSION) else {
+        set_update(&state, &tag, "error", "This build has no version.");
+        return;
+    };
+    if latest <= current {
+        set_update(&state, &tag, "current", "");
+        return;
+    }
+    let asset = if cfg!(target_arch = "aarch64") {
+        "Nightgrass-arm64.exe"
+    } else {
+        "Nightgrass-x64.exe"
+    };
+    let Some(dir) = update_dir() else {
+        set_update(&state, &tag, "error", "Nightgrass could not prepare an update folder.");
+        return;
+    };
+    set_update(&state, &tag, "downloading", asset);
+    let version_tag = format!("v{tag}");
+    if let Err(err) = quiet(
+        "gh",
+        &[
+            "release",
+            "download",
+            &version_tag,
+            "--repo",
+            REPO,
+            "--pattern",
+            asset,
+            "--dir",
+            &dir,
+            "--clobber",
+        ],
+    ) {
+        set_update(&state, &tag, "error", &err);
+        return;
+    }
+    let downloaded = PathBuf::from(&dir).join(asset);
+    let Ok(current_exe) = std::env::current_exe() else {
+        set_update(&state, &tag, "error", "Nightgrass could not find its own program.");
+        return;
+    };
+    set_update(&state, &tag, "restarting", "");
+    thread::sleep(Duration::from_millis(700));
+    if let Err(err) = stage_restart(&downloaded, &current_exe) {
+        set_update(&state, &tag, "error", &err);
+        return;
+    }
+    std::process::exit(0);
+}
+
+fn parse_version(value: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = value.trim().trim_start_matches('v').split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor, patch))
+}
+
+fn update_dir() -> Option<String> {
+    let base = std::env::var("LOCALAPPDATA").ok()?;
+    let dir = PathBuf::from(base).join("Nightgrass").join("updates");
+    fs::create_dir_all(&dir).ok()?;
+    Some(dir.to_string_lossy().to_string())
+}
+
+fn stage_restart(downloaded: &Path, current_exe: &Path) -> Result<(), String> {
+    let script = std::env::temp_dir().join("nightgrass-update.cmd");
+    let body = format!(
+        "@echo off\r\ntimeout /t 2 /nobreak >nul\r\ncopy /Y \"{}\" \"{}\"\r\nstart \"\" \"{}\"\r\n",
+        downloaded.display(),
+        current_exe.display(),
+        current_exe.display()
+    );
+    fs::write(&script, body).map_err(|err| err.to_string())?;
+    let mut command = Command::new("cmd");
+    command.args(["/C", &script.to_string_lossy()]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    command.spawn().map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+fn quiet(program: &str, args: &[&str]) -> Result<String, String> {
+    let mut command = Command::new(program);
+    command.args(args);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let output = command.output().map_err(|err| err.to_string())?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(err)
+    }
 }
 
 fn pretty_stem(stem: &str) -> String {

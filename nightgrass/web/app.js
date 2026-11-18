@@ -38,29 +38,29 @@ function packLabel(pack) {
 }
 function scenery() {
   const ground = $("ground");
-  const blades = Array.from({ length: 56 }, (_, index) => {
-    const left = index / 55 * 100;
-    const height = 48 + index * 37 % 84;
-    const lean = (index % 7 - 3) * 2.2;
-    const swing = 3 + index % 5;
-    const width = 5 + index % 4;
-    const tip = index % 5 === 0 ? "var(--firefly)" : "#b6f7a4";
-    const delay = `${index % 9 * -0.4}s`;
-    const duration = `${4.2 + index % 6 * 0.45}s`;
-    return `<span class="blade" style="left:${left}%;--h:${height}px;--w:${width}px;--lean:${lean}deg;--swing:${swing}deg;--tip:${tip};--delay:${delay};--dur:${duration}"></span>`;
+  const layers = [
+    { name: "back", count: 84, height: 36, span: 48, width: 3, fade: 0.45, lift: 0 },
+    { name: "mid", count: 72, height: 70, span: 70, width: 6, fade: 0.82, lift: 0 },
+    { name: "front", count: 40, height: 110, span: 78, width: 9, fade: 1, lift: 0 }
+  ];
+  const blades = layers.flatMap((layer) => Array.from({ length: layer.count }, (_, index) => {
+    const left = (index + index * 3 % 5 * 0.08) / layer.count * 100;
+    const height = layer.height + index * 37 % layer.span;
+    const lean = (index % 9 - 4) * 2.4;
+    const swing = 4 + index % 6;
+    const width = layer.width + index % 3;
+    const tip = index % 6 === 0 ? "var(--firefly)" : index % 4 === 0 ? "#d8ffb0" : "#b6f7a4";
+    const delay = `${index % 11 * -0.35}s`;
+    const duration = `${3.6 + index % 7 * 0.38}s`;
+    return `<span class="blade ${layer.name}" style="left:${left.toFixed(2)}%;--h:${height}px;--w:${width}px;--lean:${lean}deg;--swing:${swing}deg;--tip:${tip};--delay:${delay};--dur:${duration};--fade:${layer.fade};--lift:${layer.lift}px"></span>`;
+  }));
+  const lights = Array.from({ length: 14 }, (_, index) => {
+    const left = index * 37 % 96;
+    const bottom = 24 + index * 29 % 120;
+    return `<span class="firefly-dot" style="left:${left}%;bottom:${bottom}px;--dur:${2.4 + index % 5 * 0.45}s"></span>`;
   });
-  const lights = [
-    [12, 40],
-    [28, 70],
-    [47, 28],
-    [63, 64],
-    [81, 36],
-    [92, 72]
-  ].map(([left, bottom], index) => {
-    return `<span class="firefly-dot" style="left:${left}%;bottom:${bottom}px;--dur:${3 + index * 0.6}s"></span>`;
-  });
-  const stars = [18, 54, 76].map((left, index) => {
-    return `<svg class="spark" style="left:${left}%;bottom:${80 + index * 8}px" viewBox="0 0 20 20"><path d="M10 0 L11.6 8.4 L20 10 L11.6 11.6 L10 20 L8.4 11.6 L0 10 L8.4 8.4 Z"/></svg>`;
+  const stars = [12, 31, 48, 67, 84].map((left, index) => {
+    return `<svg class="spark" style="left:${left}%;bottom:${96 + index % 3 * 18}px" viewBox="0 0 20 20"><path d="M10 0 L11.6 8.4 L20 10 L11.6 11.6 L10 20 L8.4 11.6 L0 10 L8.4 8.4 Z"/></svg>`;
   });
   ground.innerHTML = blades.join("") + lights.join("") + stars.join("");
 }
@@ -103,7 +103,7 @@ function renderList() {
   const needle = query.trim().toLowerCase();
   if (needle) {
     const matches = catalog.faces.filter((face) => {
-      return `${face.name} ${face.pack} ${face.rel}`.toLowerCase().includes(needle);
+      return `${face.name} ${face.pack} ${face.rel} ${(face.tags || []).join(" ")}`.toLowerCase().includes(needle);
     });
     const shown = matches.slice(0, 120);
     host.innerHTML = shown.length ? `<div class="faces">${shown.map(faceButton).join("")}</div>${matches.length > shown.length ? `<p class="note">${matches.length - shown.length} more. Keep typing.</p>` : ""}` : `<p class="note">No faces match that.</p>`;
@@ -138,7 +138,8 @@ function renderList() {
 function faceButton(face) {
   const current = face.id === selected;
   const preview = current && loaded.has(face.id) ? ` style="font-family:'ng-${face.id}', Bahnschrift, sans-serif"` : "";
-  return `<button class="face" type="button" data-face="${esc(face.id)}" aria-current="${current}"${preview}><span>${esc(face.name)}</span><small>${esc(face.ext)}</small></button>`;
+  const tags = (face.tags || []).map((tag) => `<i>${esc(tag)}</i>`).join("");
+  return `<button class="face" type="button" data-face="${esc(face.id)}" aria-current="${current}"${preview}><span>${esc(face.name)}</span><small class="tags">${tags}</small></button>`;
 }
 function renderHeld() {
   const host = $("held");
@@ -159,7 +160,7 @@ function renderMeta() {
     return;
   }
   name.textContent = face.name;
-  meta.textContent = `${packLabel(face.pack)}, ${face.ext}, ${formatBytes(face.bytes)}`;
+  meta.textContent = `${packLabel(face.pack)}, ${(face.tags || [face.ext]).join(", ")}, ${formatBytes(face.bytes)}`;
   document.title = `${face.name}, Nightgrass`;
 }
 function applyMetrics() {
@@ -331,6 +332,21 @@ function wire() {
   for (const id of ["size", "track", "lead"]) {
     $(id).addEventListener("input", applyMetrics);
   }
+  document.querySelectorAll("[data-ground]").forEach((button) => {
+    button.addEventListener("click", () => setGround(button.dataset.ground || "pond"));
+  });
+  const saved = localStorage.getItem("nightgrass-ground");
+  if (saved)
+    setGround(saved);
+  $("win-min").addEventListener("click", () => frame("minimize"));
+  $("win-max").addEventListener("click", () => frame("maximize"));
+  $("win-close").addEventListener("click", () => frame("close"));
+  document.querySelector(".topbar")?.addEventListener("pointerdown", (event) => {
+    const target = event.target;
+    if (target.closest("button, input, label, .swatches"))
+      return;
+    frame("drag");
+  });
   $("ink-mist").addEventListener("click", () => setInk("mist"));
   $("ink-dew").addEventListener("click", () => setInk("dew"));
   $("align-left").addEventListener("click", () => setAlign("left"));
@@ -351,6 +367,17 @@ function wire() {
   if (!specimen.textContent?.trim())
     specimen.textContent = PRESETS.night;
 }
+function frame(message) {
+  const ipc = window.ipc;
+  ipc?.postMessage(message);
+}
+function setGround(ground) {
+  document.body.dataset.ground = ground;
+  localStorage.setItem("nightgrass-ground", ground);
+  document.querySelectorAll("[data-ground]").forEach((button) => {
+    button.setAttribute("aria-pressed", String(button.dataset.ground === ground));
+  });
+}
 function setInk(ink) {
   $("stage").dataset.ink = ink;
   $("ink-mist").setAttribute("aria-pressed", String(ink === "mist"));
@@ -366,6 +393,21 @@ function listen() {
     fetch("/api/revision").then((response) => response.json()).then((payload) => {
       if (payload.revision !== revision)
         refresh();
+    }).catch(() => {
+      return;
+    });
+    fetch("/api/update").then((response) => response.json()).then((payload) => {
+      const node = $("update");
+      if (payload.state === "current")
+        node.textContent = `Version ${payload.current} is current.`;
+      else if (payload.state === "downloading")
+        node.textContent = `Downloading ${payload.latest}…`;
+      else if (payload.state === "restarting")
+        node.textContent = `Restarting into ${payload.latest}…`;
+      else if (payload.state === "error")
+        node.textContent = payload.detail || "Update check failed.";
+      else
+        node.textContent = "Checking GitHub Latest…";
     }).catch(() => {
       return;
     });
